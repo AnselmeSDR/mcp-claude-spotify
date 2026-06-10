@@ -391,6 +391,15 @@ async function spotifyApiRequest(endpoint: string, method: string = "GET", data:
     }
   }
 
+  // If we have a refresh token but no access token yet (e.g. the token was
+  // seeded from SPOTIFY_REFRESH_TOKEN in a headless/remote environment and no
+  // tokens.json file exists), obtain an access token via the refresh flow
+  // before giving up. ensureToken() sets accessToken/tokenExpirationTime.
+  if (!accessToken && refreshToken) {
+    console.error(`No access token in memory but refresh token available; obtaining access token via refresh flow...`);
+    await ensureToken();
+  }
+
   if (!accessToken) {
     console.error(`No access token available for request to ${endpoint}`);
     throw new Error("Not authenticated. Please authorize the app first.");
