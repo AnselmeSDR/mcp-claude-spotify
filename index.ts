@@ -114,6 +114,18 @@ function saveTokens() {
  */
 function loadTokens(): boolean {
   try {
+    // Allow seeding the refresh token from an env var for headless/remote
+    // environments (e.g. cloud containers) where the browser OAuth flow and
+    // the local tokens.json file are not available. The access token is then
+    // obtained on demand via ensureToken() using the Spotify refresh endpoint.
+    if (process.env.SPOTIFY_REFRESH_TOKEN) {
+      refreshToken = process.env.SPOTIFY_REFRESH_TOKEN;
+      accessToken = null;
+      tokenExpirationTime = 0;
+      console.error('Loaded refresh token from SPOTIFY_REFRESH_TOKEN env var');
+      return true;
+    }
+
     console.error(`Attempting to load tokens from ${TOKEN_PATH}`);
 
     if (!fs.existsSync(TOKEN_PATH)) {

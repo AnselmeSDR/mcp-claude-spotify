@@ -245,6 +245,37 @@ systemctl --user status spotify-mcp.service
 
 The MCP server runs as a child process managed by Claude Desktop. When Claude is running, it automatically starts and manages the Node.js server process based on the configuration in `claude_desktop_config.json`.
 
+### Headless / remote environments (cloud agents, CI)
+
+The `auth-spotify` flow opens a local browser on `127.0.0.1:8888`, which is not available in headless or remote containers (e.g. cloud agents, scheduled routines, CI). To use the MCP there, authenticate once locally, then inject the refresh token via the `SPOTIFY_REFRESH_TOKEN` environment variable.
+
+1. Authenticate locally with `auth-spotify` (this creates `~/.spotify-mcp/tokens.json`).
+2. Extract the refresh token:
+
+```bash
+cat ~/.spotify-mcp/tokens.json | python3 -c "import sys,json; print(json.load(sys.stdin)['refreshToken'])"
+```
+
+3. Provide it alongside the credentials in the remote environment:
+
+```json
+{
+  "mcpServers": {
+    "spotify": {
+      "command": "node",
+      "args": ["ABSOLUTE_PATH/mcp-claude-spotify/build/index.js"],
+      "env": {
+        "SPOTIFY_CLIENT_ID": "your_client_id_here",
+        "SPOTIFY_CLIENT_SECRET": "your_client_secret_here",
+        "SPOTIFY_REFRESH_TOKEN": "your_refresh_token_here"
+      }
+    }
+  }
+}
+```
+
+When `SPOTIFY_REFRESH_TOKEN` is set, the server skips the local `tokens.json` file and obtains access tokens on demand via the Spotify refresh endpoint — no browser required. The Spotify refresh token does not expire unless access is revoked, making it suitable for long-running routines.
+
 ## Available Tools
 
 ### Authentication
