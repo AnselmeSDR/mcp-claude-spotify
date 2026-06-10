@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "spotify": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "npm install --omit=dev --no-audit --no-fund >&2 && exec node build/index.js"
+      ],
+      "env": {
+        "SPOTIFY_CLIENT_ID": "${SPOTIFY_CLIENT_ID}",
+        "SPOTIFY_CLIENT_SECRET": "${SPOTIFY_CLIENT_SECRET}",
+        "SPOTIFY_REFRESH_TOKEN": "${SPOTIFY_REFRESH_TOKEN}"
+      }
+    }
+  }
+}
