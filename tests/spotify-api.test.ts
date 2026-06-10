@@ -175,10 +175,33 @@ describe('Spotify API Functions', () => {
     it('should throw an error if not authenticated', async () => {
       accessToken = null;
       refreshToken = null;
-      
+
       await expect(spotifyApiRequest('/me/playlists')).rejects.toThrow(
         'Not authenticated. Please authorize the app first.'
       );
+    });
+
+    it('should bootstrap an access token from the refresh token when none is in memory (headless/remote seed)', async () => {
+      // Regression test: in headless/remote environments the refresh token is
+      // seeded from SPOTIFY_REFRESH_TOKEN while accessToken stays null and no
+      // tokens.json file exists. The request must obtain an access token via the
+      // refresh flow instead of throwing "Not authenticated".
+      accessToken = null;
+      refreshToken = 'seeded-refresh-token';
+      tokenExpirationTime = 0;
+
+      const result = await spotifyApiRequest('/me/top/tracks?limit=50&offset=0&time_range=short_term');
+
+      // The token was obtained through the auth endpoint...
+      expect(mockAxios.post).toHaveBeenCalledWith(`${SPOTIFY_AUTH_BASE}/api/token`);
+      // ...and the API call went out with the freshly obtained bearer token.
+      expect(mockAxios.default).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: `${SPOTIFY_API_BASE}/me/top/tracks?limit=50&offset=0&time_range=short_term`,
+          headers: expect.objectContaining({ Authorization: 'Bearer mock-token' }),
+        })
+      );
+      expect(result).toBeDefined();
     });
 
     it('should throw an error when API request fails', async () => {
