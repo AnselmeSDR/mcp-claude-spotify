@@ -18,6 +18,8 @@
 </tr>
 </table>
 
+> 📖 **Using this MCP with Claude (local & cloud routines)** — see [docs/USING_WITH_CLAUDE.md](docs/USING_WITH_CLAUDE.md) for the full connection guide, including headless/remote setup, scheduled cloud routines, and troubleshooting.
+
 ## Features
 
 - Spotify authentication
