@@ -17,7 +17,7 @@ import path from "path";
 import os from "os";
 import { promisify } from "util";
 import { exec } from "child_process";
-import { ServerAlreadyRunningError } from "./errors.js";
+import { ServerAlreadyRunningError, AuthenticationError } from "./errors.js";
 import { SpotifyPlaylist } from "./types.js";
 
 dotenv.config();
@@ -289,14 +289,106 @@ const server = new Server(
 );
 
 /**
+ * Returns true when a token-refresh request was rejected with invalid_grant,
+ * i.e. the refresh token is expired or revoked and must be discarded.
+ * (Spotify refresh tokens expire after six months as of 2026-07-20.)
+ */
+function isInvalidGrant(error: any): boolean {
+  return error?.response?.status === 400 && error?.response?.data?.error === "invalid_grant";
+}
+
+/**
+ * Discards stored credentials after a permanent auth failure: clears the
+ * in-memory tokens and removes the on-disk token file so a restart does not
+ * reload a dead refresh token. The user must re-run the sign-in flow.
+ */
+function discardStoredTokens() {
+  accessToken = null;
+  refreshToken = null;
+  tokenExpirationTime = 0;
+  try {
+    if (fs.existsSync(TOKEN_PATH)) {
+      fs.rmSync(TOKEN_PATH);
+      console.error(`Discarded stored tokens at ${TOKEN_PATH}`);
+    }
+  } catch (err) {
+    console.error(`Failed to remove token file while discarding tokens: ${err}`);
+  }
+}
+
+/**
+ * Refreshes the access token using the current refresh token.
+ *
+ * On success, updates accessToken/tokenExpirationTime (and refreshToken if
+ * Spotify rotated it) and persists them. On an invalid_grant response the
+ * refresh token is expired or revoked: the stored credentials are discarded
+ * and an AuthenticationError is thrown so the user is sent back through the
+ * sign-in flow (we never retry the same dead token). On transient failures
+ * (network, 5xx, timeout, host-not-in-allowlist) the refresh token is kept and
+ * a generic error is thrown so a later call can retry.
+ *
+ * @returns {Promise<string>} The freshly obtained access token.
+ */
+async function refreshAccessToken(): Promise<string> {
+  if (!refreshToken) {
+    throw new AuthenticationError("Not authenticated. Please authorize the app first.");
+  }
+
+  try {
+    const response = await axios.post(
+      `${SPOTIFY_AUTH_BASE}/api/token`,
+      querystring.stringify({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+      }),
+      {
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Authorization: `Basic ${Buffer.from(
+            `${CLIENT_ID}:${CLIENT_SECRET}`
+          ).toString("base64")}`,
+        },
+      }
+    );
+
+    accessToken = response.data.access_token;
+    tokenExpirationTime = Date.now() + response.data.expires_in * 1000;
+
+    if (response.data.refresh_token) {
+      refreshToken = response.data.refresh_token;
+    }
+
+    saveTokens();
+    console.error(`Token refreshed successfully, expires at ${new Date(tokenExpirationTime).toISOString()}`);
+    return accessToken as string;
+  } catch (error: any) {
+    if (isInvalidGrant(error)) {
+      console.error("Refresh token expired or revoked (invalid_grant); discarding stored credentials");
+      discardStoredTokens();
+      throw new AuthenticationError(
+        "Spotify refresh token expired or revoked (invalid_grant). Stored credentials were discarded — re-authenticate with the auth-spotify tool (or set a fresh SPOTIFY_REFRESH_TOKEN in headless/remote environments)."
+      );
+    }
+
+    // Transient failure: keep the refresh token so a later call can retry, but
+    // drop the (missing/expired) access token.
+    accessToken = null;
+    tokenExpirationTime = 0;
+    console.error(`Token refresh failed (transient): ${error.message}`);
+    throw new Error(`Could not refresh Spotify access token (temporary error): ${error.message}. The refresh token was kept; please retry shortly.`);
+  }
+}
+
+/**
  * Ensures a valid access token is available
- * 
+ *
  * This function checks if the current access token is valid, and if not,
- * attempts to refresh it using the refresh token. If refresh fails or no
- * refresh token is available, it returns null indicating authentication
- * is required.
- * 
- * @returns {Promise<string|null>} The valid access token or null if authentication is needed
+ * attempts to refresh it using the refresh token. A transient refresh failure
+ * returns null (the refresh token is preserved for a later retry), while an
+ * invalid_grant failure rethrows an AuthenticationError so the caller can send
+ * the user back through the sign-in flow.
+ *
+ * @returns {Promise<string|null>} The valid access token or null if a (transient) refresh failed or no refresh token exists
  */
 async function ensureToken(): Promise<string | null> {
   const now = Date.now();
@@ -310,46 +402,22 @@ async function ensureToken(): Promise<string | null> {
     return accessToken;
   }
 
-  if (refreshToken) {
-    try {
-      const response = await axios.post(
-        `${SPOTIFY_AUTH_BASE}/api/token`,
-        querystring.stringify({
-          grant_type: "refresh_token",
-          refresh_token: refreshToken,
-        }),
-        {
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            Authorization: `Basic ${Buffer.from(
-              `${CLIENT_ID}:${CLIENT_SECRET}`
-            ).toString("base64")}`,
-          },
-        }
-      );
-
-      accessToken = response.data.access_token;
-      tokenExpirationTime = now + response.data.expires_in * 1000;
-
-      if (response.data.refresh_token) {
-        refreshToken = response.data.refresh_token;
-      }
-
-      saveTokens();
-
-      console.error(`Token refreshed successfully, new token expires in ${response.data.expires_in} seconds`);
-      return accessToken;
-    } catch (error: any) {
-      console.error("Error refreshing token:", error.message);
-      accessToken = null;
-      refreshToken = null;
-      tokenExpirationTime = 0;
-
-      saveTokens();
-    }
+  if (!refreshToken) {
+    return null;
   }
 
-  return null;
+  try {
+    return await refreshAccessToken();
+  } catch (error: any) {
+    // invalid_grant means the refresh token is dead: surface the
+    // re-authentication requirement. Transient failures keep the refresh token,
+    // so we just report "no token available" and allow a later retry.
+    if (error instanceof AuthenticationError) {
+      throw error;
+    }
+    console.error(`Token refresh failed (transient), keeping refresh token: ${error.message}`);
+    return null;
+  }
 }
 
 /**
@@ -391,79 +459,21 @@ async function spotifyApiRequest(endpoint: string, method: string = "GET", data:
     }
   }
 
-  // If we have a refresh token but no access token yet (e.g. the token was
-  // seeded from SPOTIFY_REFRESH_TOKEN in a headless/remote environment and no
-  // tokens.json file exists), obtain an access token via the refresh flow
-  // before giving up. ensureToken() sets accessToken/tokenExpirationTime.
-  if (!accessToken && refreshToken) {
-    console.error(`No access token in memory but refresh token available; obtaining access token via refresh flow...`);
-    await ensureToken();
-  }
-
-  if (!accessToken) {
-    console.error(`No access token available for request to ${endpoint}`);
-    throw new Error("Not authenticated. Please authorize the app first.");
-  }
-
+  // Refresh the access token when it is missing (e.g. seeded from
+  // SPOTIFY_REFRESH_TOKEN in a headless/remote environment) or expired.
+  // refreshAccessToken() discards the stored credentials and throws an
+  // AuthenticationError on invalid_grant (expired/revoked refresh token), and
+  // keeps the refresh token on transient failures so a later call can retry.
   const now = Date.now();
-  if (now >= tokenExpirationTime - 60000) {
-    if (refreshToken) {
-      try {
-        console.error(`Token expired, attempting to refresh...`);
-        const response = await axios.post(
-          `${SPOTIFY_AUTH_BASE}/api/token`,
-          querystring.stringify({
-            grant_type: "refresh_token",
-            refresh_token: refreshToken,
-          }),
-          {
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-              Authorization: `Basic ${Buffer.from(
-                `${CLIENT_ID}:${CLIENT_SECRET}`
-              ).toString("base64")}`,
-            },
-          }
-        );
-
-        accessToken = response.data.access_token;
-        tokenExpirationTime = now + response.data.expires_in * 1000;
-
-        if (response.data.refresh_token) {
-          refreshToken = response.data.refresh_token;
-        }
-
-        console.error(`Token refreshed successfully, expires at ${new Date(tokenExpirationTime).toISOString()}`);
-
-        try {
-          if (!fs.existsSync(TOKEN_DIR)) {
-            fs.mkdirSync(TOKEN_DIR, { recursive: true });
-          }
-
-          const tokenData = JSON.stringify({
-            accessToken,
-            refreshToken,
-            tokenExpirationTime
-          }, null, 2);
-
-          fs.writeFileSync(TOKEN_PATH, tokenData);
-          console.error(`Refreshed tokens saved to file`);
-        } catch (saveError) {
-          console.error(`Failed to save refreshed tokens: ${saveError}`);
-        }
-      } catch (refreshError) {
-        console.error(`Failed to refresh token: ${refreshError}`);
-        accessToken = null;
-        refreshToken = null;
-        tokenExpirationTime = 0;
-        throw new Error("Authentication expired. Please authenticate again.");
-      }
-    } else {
-      console.error(`Token expired but no refresh token available`);
-      accessToken = null;
-      tokenExpirationTime = 0;
-      throw new Error("Authentication expired. Please authenticate again.");
+  const needsRefresh = !accessToken || now >= tokenExpirationTime - 60000;
+  if (needsRefresh) {
+    if (!refreshToken) {
+      console.error(`No usable access token and no refresh token for request to ${endpoint}`);
+      throw new Error("Not authenticated. Please authorize the app first.");
     }
+
+    console.error(`Access token missing or expired, refreshing before request to ${endpoint}...`);
+    await refreshAccessToken();
   }
 
   console.error(`Making authenticated request to ${endpoint}`);
@@ -488,11 +498,13 @@ async function spotifyApiRequest(endpoint: string, method: string = "GET", data:
       console.error(`Data:`, error.response.data);
 
       if (error.response.status === 401) {
-        console.error(`Token appears to be invalid, clearing tokens`);
+        // The access token was rejected. Drop it so the next call refreshes,
+        // but keep the refresh token: only an invalid_grant on refresh means
+        // the refresh token itself is dead.
+        console.error(`Access token rejected (401), clearing it so the next request refreshes`);
         accessToken = null;
-        refreshToken = null;
         tokenExpirationTime = 0;
-        throw new Error("Authorization expired. Please authenticate again.");
+        throw new Error("Spotify rejected the access token (401). It was cleared and will be refreshed on the next request; re-authenticate with auth-spotify if this persists.");
       }
     }
     const detail = error.response?.data ? (typeof error.response.data === 'object' ? JSON.stringify(error.response.data) : String(error.response.data)) : '';

@@ -27,61 +27,100 @@ let accessToken: string | null = null;
 let refreshToken: string | null = null;
 let tokenExpirationTime = 0;
 
-// Function implementations for testing
+// Function implementations for testing — mirror the source's token handling.
+
+// Local mirror of the source's AuthenticationError so tests can assert the type.
+class AuthenticationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuthenticationError';
+  }
+}
+
+function isInvalidGrant(error: any): boolean {
+  return error?.response?.status === 400 && error?.response?.data?.error === 'invalid_grant';
+}
+
+async function refreshAccessToken(): Promise<string> {
+  if (!refreshToken) {
+    throw new AuthenticationError("Not authenticated. Please authorize the app first.");
+  }
+
+  try {
+    const response = await mockAxios.post(`${SPOTIFY_AUTH_BASE}/api/token`);
+
+    accessToken = response.data.access_token;
+    tokenExpirationTime = Date.now() + response.data.expires_in * 1000;
+
+    if (response.data.refresh_token) {
+      refreshToken = response.data.refresh_token;
+    }
+
+    return accessToken as string;
+  } catch (error: any) {
+    if (isInvalidGrant(error)) {
+      // Expired/revoked refresh token: discard the stored credentials.
+      accessToken = null;
+      refreshToken = null;
+      tokenExpirationTime = 0;
+      throw new AuthenticationError("invalid_grant: re-authenticate with auth-spotify");
+    }
+    // Transient failure: keep the refresh token for a later retry.
+    accessToken = null;
+    tokenExpirationTime = 0;
+    throw new Error(`Could not refresh Spotify access token (temporary error): ${error.message}`);
+  }
+}
+
 async function ensureToken(): Promise<string | null> {
   const now = Date.now();
-  
+
   // Return existing token if not expired (with 1-minute buffer)
   if (accessToken && now < tokenExpirationTime - 60000) {
     return accessToken;
   }
-  
-  // Try to refresh the token if we have a refresh token
-  if (refreshToken) {
-    try {
-      const response = await mockAxios.post(`${SPOTIFY_AUTH_BASE}/api/token`);
-      
-      accessToken = response.data.access_token;
-      tokenExpirationTime = now + response.data.expires_in * 1000;
-      
-      if (response.data.refresh_token) {
-        refreshToken = response.data.refresh_token;
-      }
-      
-      return accessToken;
-    } catch (error: any) {
-      console.error("Error refreshing token:", error.message);
-      accessToken = null;
-      refreshToken = null;
-      tokenExpirationTime = 0;
-      return null;
-    }
+
+  if (!refreshToken) {
+    return null;
   }
-  
-  return null;
+
+  try {
+    return await refreshAccessToken();
+  } catch (error: any) {
+    // invalid_grant must surface so the caller re-authenticates; transient
+    // failures keep the refresh token and return null for a later retry.
+    if (error instanceof AuthenticationError) {
+      throw error;
+    }
+    return null;
+  }
 }
 
 async function spotifyApiRequest(
-  endpoint: string, 
-  method: string = "GET", 
+  endpoint: string,
+  method: string = "GET",
   data: any = null
 ): Promise<any> {
-  const token = await ensureToken();
-  if (!token) {
-    throw new Error("Not authenticated. Please authorize the app first.");
+  const now = Date.now();
+  const needsRefresh = !accessToken || now >= tokenExpirationTime - 60000;
+  if (needsRefresh) {
+    if (!refreshToken) {
+      throw new Error("Not authenticated. Please authorize the app first.");
+    }
+    await refreshAccessToken();
   }
-  
+
   try {
     const response = await mockAxios.default({
       method,
       url: `${SPOTIFY_API_BASE}${endpoint}`,
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
       },
       data: data ? data : undefined,
     });
-    
+
     return response.data;
   } catch (error: any) {
     throw new Error(`Spotify API error: ${error.message}`);
@@ -128,15 +167,32 @@ describe('Spotify API Functions', () => {
       expect(token).toBeNull();
     });
 
-    it('should handle errors when refreshing token', async () => {
+    it('should keep the refresh token on a transient refresh failure', async () => {
       // Set token as expired to trigger refresh
       tokenExpirationTime = Date.now() - 1000;
-      
-      // Mock error for this test
+
+      // A network blip has no HTTP response → treated as transient
       mockAxios.post.mockRejectedValueOnce(new Error('Network error'));
-      
+
       const token = await ensureToken();
       expect(token).toBeNull();
+      expect(accessToken).toBeNull();
+      // The refresh token must survive so a later call can retry.
+      expect(refreshToken).toBe('test-refresh-token');
+    });
+
+    it('should discard the refresh token and throw on invalid_grant', async () => {
+      // Set token as expired to trigger refresh
+      tokenExpirationTime = Date.now() - 1000;
+
+      // Spotify returns 400 invalid_grant when the refresh token is expired/revoked
+      mockAxios.post.mockRejectedValueOnce({
+        message: 'Request failed with status code 400',
+        response: { status: 400, data: { error: 'invalid_grant' } },
+      });
+
+      await expect(ensureToken()).rejects.toThrow('invalid_grant');
+      // The dead credentials must be discarded so they are not reused.
       expect(accessToken).toBeNull();
       expect(refreshToken).toBeNull();
     });
@@ -202,6 +258,23 @@ describe('Spotify API Functions', () => {
         })
       );
       expect(result).toBeDefined();
+    });
+
+    it('should surface a re-auth error when the refresh token is expired (invalid_grant)', async () => {
+      // Access token expired and the refresh returns invalid_grant: the request
+      // must abort with an actionable re-auth error and discard the credentials.
+      accessToken = 'expired-token';
+      tokenExpirationTime = Date.now() - 1000;
+      mockAxios.post.mockRejectedValueOnce({
+        message: 'Request failed with status code 400',
+        response: { status: 400, data: { error: 'invalid_grant' } },
+      });
+
+      await expect(spotifyApiRequest('/me/playlists')).rejects.toThrow('invalid_grant');
+      expect(accessToken).toBeNull();
+      expect(refreshToken).toBeNull();
+      // The API call must never go out with dead credentials.
+      expect(mockAxios.default).not.toHaveBeenCalled();
     });
 
     it('should throw an error when API request fails', async () => {
